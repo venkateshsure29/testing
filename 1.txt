@@ -1,369 +1,159 @@
-#!/usr/bin/env python3
-import sys
-import socket
-import platform
-import distro
-import psutil
-import ctypes
-import os
-import platform
-import shutil
+import asyncio
 import subprocess
-
-
+import requests
+import urllib3
 from datetime import datetime
 import pytz
+from playwright.async_api import async_playwright
 
-print(f"\nFinding the operating system and version using the built-in platform module for general details")
-my_os = platform.system()
-my_os_version = platform.release()
-print("OS :",my_os)
-print("Version :",my_os_version)
-def get_os_info():
-    print(f"System: {platform.system()}")
-    print(f"Node Name: {platform.node()}")
-    print(f"Release: {platform.release()}")
-    print(f"Version: {platform.version()}")
-    print(f"Machine: {platform.machine()}")
+# --- CONFIGURATION ---
+URLS_TO_CHECK = [
+"http://dc04plvcfe305:8070/pdt_fhir_nexus/dashboard?Etl_load_ids=2299,2296",
+"http://dc04plvcfe305:8070/pdt_fhir_nexus/appHealthCheck",
+"http://dc04plvcfe305:8071/pdt_fhir_nexus/appHealthCheck",
+"http://dc04plvcfe305:8072/pdt_fhir_nexus/appHealthCheck",
+"http://dc04plvcfe305:8073/pdt_fhir_nexus/appHealthCheck",
+"http://dc04plvcfe305:8074/pdt_fhir_nexus/appHealthCheck",
+"http://dc04plvcfe305:8075/pdt_fhir_nexus/appHealthCheck",
+"http://dc04plvcfe305:8076/pdt_fhir_nexus/appHealthCheck",
+"http://dc04plvcfe305:8077/pdt_fhir_nexus/appHealthCheck",
+"http://dc04plvcfe305:8078/pdt_fhir_nexus/appHealthCheck",
+"http://dc04plvcfe305:8078/pdt_fhir_nexus/dashboard"
+]
+DASHBOARD_URL = "http://dc04plvcfe305:8078/pdt_fhir_nexus/dashboard"
+SUCCESS_THRESHOLD = 80.0
+EMAIL_RECIPIENT = "kirankumar.kantem@carelon.com"
 
-get_os_info()
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-print(f"\nFinding the operating system and version using the third-party distro package for specific Linux distribution information")
-def get_linux_distro_info():
-    print(f"Distribution Name: {distro.name()}")
-    print(f"Version: {distro.version()}")
-    print(f"Like IDs: {distro.like()}")
-    print(f"Pretty Name: {distro.os_release_info().get('PRETTY_NAME')}")
+# Global State
+ALERTS_FOUND = False
+ERROR_TABLES_DATA = []
+URL_STATUSES = []
+T1_HEALTHY = T2_HEALTHY = True
 
-get_linux_distro_info()
+def get_current_shift():
+    ist = pytz.timezone("Asia/Kolkata")
+    hour = datetime.now(ist).hour
+    return "S1" if 6 <= hour < 14 else "S2" if 14 <= hour < 22 else "S3"
 
-print(f"\nFinding hostname, IP address, and FQDN (Fully Qualified Domain Name) using built-in socket module")
-def get_network_info():
+today = datetime.today().strftime("%dth %B %Y")
+SHIFT = get_current_shift()
+
+async def check_url_status():
+    global URL_STATUSES
+    for url in URLS_TO_CHECK:
+        try:
+            # Using 10s timeout for stability in 2026 network environments
+            response = requests.get(url, verify=False, timeout=10)
+            status_info = {
+                "url": url,
+                "code": response.status_code,
+                "status": "✅ UP" if response.status_code == 200 else "❌ DOWN"
+            }
+        except Exception as e:
+            status_info = {"url": url, "code": "ERR", "status": f"❌ {str(e)[:15]}"}
+        URL_STATUSES.append(status_info)
+
+async def validate_dashboard(page):
+    """Scrapes and validates tables using Playwright's async locator API."""
+    global ALERTS_FOUND, ERROR_TABLES_DATA, T1_HEALTHY, T2_HEALTHY
+
+    # Table 1: Performance Metrics (Validation: Success % < Threshold)
+    table1 = page.locator("table", has_text="Success %")
+    if await table1.count() > 0:
+        headers = await table1.locator("th").all_inner_texts()
+        idx = next((i for i, h in enumerate(headers) if "Success %" in h), -1)
+        rows = await table1.locator("tbody tr").all()
+        errs = []
+        for row in rows:
+            cells = await row.locator("td").all_inner_texts()
+            if cells and idx != -1:
+                try:
+                    val = float(cells[idx].replace('%',''))
+                    if val < SUCCESS_THRESHOLD: errs.append(cells)
+                except ValueError: continue
+        if errs:
+            T1_HEALTHY = False
+            ALERTS_FOUND = True
+            ERROR_TABLES_DATA.append({'id': 1, 'title': 'Performance Metrics', 'headers': headers, 'rows': errs})
+
+    # Table 2: Load Status (Validation: Publish Ind == 'N')
+    table2 = page.locator("table", has_text="Load Id")
+    if await table2.count() > 0:
+        headers = await table2.locator("th").all_inner_texts()
+        idx = next((i for i, h in enumerate(headers) if "Publish Ind" in h), -1)
+        rows = await table2.locator("tbody tr").all()
+        errs = []
+        for row in rows:
+            cells = await row.locator("td").all_inner_texts()
+            if cells and idx != -1 and cells[idx].strip().upper() == "N":
+                errs.append(cells)
+        if errs:
+            T2_HEALTHY = False
+            ALERTS_FOUND = True
+            ERROR_TABLES_DATA.append({'id': 2, 'title': 'Load Status', 'headers': headers, 'rows': errs})
+
+def render_error_table(t):
+    headers = [h.strip() for h in t['headers']]
+    table_id = t.get('id')
+    err_idx = headers.index("Success %") if table_id == 1 else headers.index("Publish Ind")
+    
+    html = "<table border='1' cellpadding='5' style='border-collapse:collapse;width:100%;font-family:Arial;font-size:12px;'>"
+    html += "<tr style='background:#E0E0E0;'>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>"
+    for row in t['rows']:
+        html += "<tr bgcolor='#FFFF00'>"
+        for i, val in enumerate(row):
+            cell_style = "bgcolor='#FF0000' style='color:white;font-weight:bold;'" if i == err_idx else ""
+            html += f"<td {cell_style}>{val}</td>"
+        html += "</tr>"
+    return html + "</table><br>"
+
+async def send_linux_email():
+    """Invokes the Linux mailx binary to send HTML emails."""
+    all_urls_up = all(s['code'] == 200 for s in URL_STATUSES)
+    subject = f"[SPS MONITORING] {'✅ OK' if (not ALERTS_FOUND and all_urls_up) else '🚨 ALERT'}: PDT - {SHIFT} - {today}"
+    
+    html_body = f"<h2>PDT Dashboard Health Check - {SHIFT}</h2>"
+    # URL Status Section
+    html_body += "<h3>1. URL Connectivity Status</h3><table border='1' style='border-collapse:collapse;width:100%;'>"
+    html_body += "<tr style='background:#E0E0E0;'><th>URL</th><th>Code</th><th>Status</th></tr>"
+    for s in URL_STATUSES:
+        html_body += f"<tr style='background:{'#ffffff' if s['code']==200 else '#ffcccc'};'><td>{s['url']}</td><td>{s['code']}</td><td>{s['status']}</td></tr>"
+    html_body += "</table><br><h3>2. Data Validation Results</h3>"
+    
+    # Data Validation Section
+    html_body += "<p style='color:green;'>✅ Table 1 is Good.</p>" if T1_HEALTHY else render_error_table(next(i for i in ERROR_TABLES_DATA if i['id']==1))
+    html_body += "<p style='color:green;'>✅ Table 2 is Good.</p>" if T2_HEALTHY else render_error_table(next(i for i in ERROR_TABLES_DATA if i['id']==2))
+
+    full_html = f"<html><body>{html_body}</body></html>"
+    
     try:
-        # Get the short hostname
-        hostname = socket.gethostname()
-
-        # Get the Fully Qualified Domain Name (FQDN)
-        # This works by letting the system's resolver (e.g., /etc/hosts, DNS) determine the FQDN
-        fqdn = socket.getfqdn()
-
-        # Get the IP address associated with the hostname
-        # Note: This might return the loopback address (127.0.0.1) in some environments
-        # if the local machine doesn't have proper network/DNS configuration
-        ip_address = socket.gethostbyname(hostname)
-
-        print(f"Hostname: {hostname}")
-        print('Hostname:', socket.gethostname())
-        print(f"FQDN: {fqdn}")
-        print('FQDN:', socket.getfqdn())
-        print(f"IP Address: {ip_address}")
-
-    except socket.gaierror as e:
-        print(f"Error getting network information: {e}")
-        print("Ensure your machine is properly configured on the network (e.g., /etc/hosts file, DNS settings).")
+        # Flag -a "Content-Type: text/html" ensures rendering in modern clients
+        proc = subprocess.Popen(['mailx', '-a', 'Content-Type: text/html', '-s', subject, EMAIL_RECIPIENT], 
+                                stdin=subprocess.PIPE, encoding='utf-8')
+        proc.communicate(input=full_html)
+        print("✅ Linux mailx notification sent.")
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        print(f"❌ mailx Error: {e}")
+
+async def main():
+    print(f"🚀 Starting Monitoring: {SHIFT} ({today})")
+    await check_url_status()
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        try:
+            await page.goto(DASHBOARD_URL, timeout=30000)
+            await page.wait_for_timeout(5000) # Give dynamic tables time to render
+            await validate_dashboard(page)
+            await send_linux_email()
+        except Exception as e:
+            print(f"❌ Playwright Error: {e}")
+        finally:
+            await browser.close()
+    print("🏁 Execution Finished.")
 
 if __name__ == "__main__":
-    get_network_info()
-
-print(f"\nFinding IP Address when socket.gethostbyname(hostname) returns the loopback address (127.0.0.1), by using common workaround that connects to an external server (like Google's DNS server) to determine the local IP used for outbound connections, without sending any data")
-def get_actual_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        # Connect to an external IP address (e.g., Google's DNS server)
-        # This doesn't send data but establishes the correct local interface for the route
-        s.connect(("8.8.8.8", 80))
-        ip_address = s.getsockname()[0]
-    except socket.error:
-        ip_address = '127.0.0.1' # Fallback to loopback if no network
-    finally:
-        s.close()
-    return ip_address
-
-# To use:
-actual_ip = get_actual_ip()
-print(f"Actual IP Address: {actual_ip}")
-
-
-
-
-
-
-print('Python Version', sys.version[:6])
-
-
-print(f"\nParsing /proc/meminfo file using built in functions")
-def parse_meminfo():
-    meminfo = {}
-    with open('/proc/meminfo', 'r') as f:
-        for line in f:
-            # Split the line into key-value-unit
-            parts = line.strip().split()
-            if len(parts) >= 2:
-                key = parts[0].rstrip(':')
-                value = int(parts[1]) # Values are in KiB
-                meminfo[key] = value
-    return meminfo
-
-def get_memory_usage_builtin():
-    data = parse_meminfo()
-    
-    # The 'MemAvailable' field gives the best estimate of usable RAM
-    # If 'MemAvailable' is not present (very old kernels), approximate used memory
-    if 'MemAvailable' in data:
-        available_mib = round(data['MemAvailable'] / 1024, 2)
-        total_mib = round(data['MemTotal'] / 1024, 2)
-        used_mib = round((data['MemTotal'] - data['MemAvailable']) / 1024, 2)
-        percent_used = round((used_mib / total_mib) * 100, 2)
-    else:
-        # Fallback approximation for older systems
-        used_mib = round((data['MemTotal'] - data['MemFree'] - data.get('Buffers', 0) - data.get('Cached', 0)) / 1024, 2)
-        total_mib = round(data['MemTotal'] / 1024, 2)
-        available_mib = round((data['MemFree'] + data.get('Buffers', 0) + data.get('Cached', 0)) / 1024, 2)
-        percent_used = round((used_mib / total_mib) * 100, 2)
-
-    print(f"Memory Status (MiB):")
-    print(f"  Total:    {total_mib} MiB")
-    print(f"  Available: {available_mib} MiB")
-    print(f"  Used:     {used_mib} MiB")
-    print(f"  Percent:  {percent_used}% used")
-
-if __name__ == "__main__":
-    get_memory_usage_builtin()
-
-print(f"\nChecking System Memory Usage using psutil library")
-def get_memory_usage():
-    # Get system memory usage statistics
-    mem = psutil.virtual_memory()
-    
-    # Convert bytes to human-readable format (e.g., GB)
-    total_gb = round(mem.total / (1024**3), 2)
-    available_gb = round(mem.available / (1024**3), 2)
-    used_gb = round(mem.used / (1024**3), 2)
-    percent_used = mem.percent
-
-    print(f"Memory Status:")
-    print(f"Total RAM: {round(psutil.virtual_memory().total/1073741824, 2)} GB")
-    print(f"Free RAM: {round(psutil.virtual_memory().available/1073741824, 2)} GB")
-    print(f"  Total:    {total_gb} GB")
-    print(f"  Available: {available_gb} GB")
-    print(f"  Used:     {used_gb} GB")
-    print(f"  Percent:  {percent_used}% used")
-
-if __name__ == "__main__":
-    get_memory_usage()
-
-
-print(f"\nChecking System Memory Usage using psutil library and current python script memory usage")
-def get_system_memory_usage():
-    """Retrieves total, available, used, and percentage memory usage of the system."""
-    mem = psutil.virtual_memory()
-    print(f"Total Memory: {mem.total / (1024**3):.2f} GB")
-    print(f"Available Memory: {mem.available / (1024**3):.2f} GB")
-    print(f"Used Memory: {mem.used / (1024**3):.2f} GB")
-    print(f"Memory Usage Percentage: {mem.percent}%")
-
-def get_current_process_memory_usage():
-    """Retrieves the memory usage of the current Python script process."""
-    process = psutil.Process(os.getpid())
-    # Get memory info (rss is Resident Set Size, the non-swapped physical memory used)
-    memory_info = process.memory_info()
-    memory_use_mb = memory_info.rss / (1024 * 1024)  # Convert bytes to MB
-    print(f"Current Python process memory usage: {memory_use_mb:.2f} MB")
-
-if __name__ == "__main__":
-    print("--- System Memory Usage ---")
-    get_system_memory_usage()
-    print("\n--- Current Python Process Memory Usage ---")
-    get_current_process_memory_usage()
-
-
-print(f"\nChecking System Swap Usage using psutil library")
-def get_swap_usage():
-    """
-    Retrieves and prints the system's swap memory usage statistics.
-    """
-    swap_info = psutil.swap_memory()
-
-    print(f"Swap Total: {swap_info.total / (1024**3):.2f} GB")
-    print(f"Swap Used: {swap_info.used / (1024**3):.2f} GB")
-    print(f"Swap Free: {swap_info.free / (1024**3):.2f} GB")
-    print(f"Swap Usage Percentage: {swap_info.percent}%")
-    print(f"Bytes swapped in (sin): {swap_info.sin} bytes")
-    print(f"Bytes swapped out (sout): {swap_info.sout} bytes")
-
-if __name__ == "__main__":
-    get_swap_usage()
-
-print(f"\nRunning 'free -mh' command using subprocess function")
-def check_mem_usage_subprocess():
-    """
-    Runs the 'free -mh' command and prints the output.
-    """
-    try:
-        # The command and its arguments must be a list
-        result = subprocess.check_output(["free", "-m", "-h",], universal_newlines=True)
-        print(result)
-    except FileNotFoundError:
-        print("Error: 'free' command not found. Are you on a Linux system?")
-    except Exception as e:
-        print(f"An error occurred: {e}")
-
-if __name__ == "__main__":
-    check_mem_usage_subprocess()
-
-
-
-print(f"\nChecking Disk Usage using shutil module")
-def check_disk_usage(path="/"):
-    """
-    Checks the disk usage of a given path.
-    :param path: The filesystem path to check (default is root '/').
-    :return: A dictionary with total, used, free space in GB, and percentage used.
-    """
-    try:
-        # Get disk usage statistics in bytes
-        usage = shutil.disk_usage(path)
-        
-        # Convert bytes to Gigabytes (GB) for readability and calculate percentage
-        total_gb = usage.total / (1024**3)
-        used_gb = usage.used / (1024**3)
-        free_gb = usage.free / (1024**3)
-        percent_used = (usage.used / usage.total) * 100
-
-        return {
-            "path": path,
-            "total_gb": round(total_gb, 2),
-            "used_gb": round(used_gb, 2),
-            "free_gb": round(free_gb, 2),
-            "percent_used": round(percent_used, 2)
-        }
-    except FileNotFoundError:
-        print(f"Error: The path '{path}' was not found.")
-        sys.exit(1)
-
-# Example Usage:
-if __name__ == "__main__":
-    # Check the root directory '/'
-    disk_info = check_disk_usage("/")
-    
-    print(f"Disk Usage Statistics for '{disk_info['path']}':")
-    print(f"  Total Space: {disk_info['total_gb']} GB")
-    print(f"  Used Space:  {disk_info['used_gb']} GB")
-    print(f"  Free Space:  {disk_info['free_gb']} GB")
-    print(f"  Used Percent: {disk_info['percent_used']}%")
-
-
-print(f"\nChecking Disk Usage using psutil library")
-def check_disk_usage_psutil(path="/"):
-    """
-    Checks disk usage using the psutil library.
-    """
-    try:
-        disk_usage = psutil.disk_usage(path)
-        print(f"Disk Usage for: {path}")
-        print(f"Total: {disk_usage.total / (1024**3):.2f} GB")
-        print(f"Used: {disk_usage.used / (1024**3):.2f} GB")
-        print(f"Free: {disk_usage.free / (1024**3):.2f} GB")
-        print(f"Percentage Used: {disk_usage.percent}%")
-
-    except Exception as e:
-        print(f"An error occurred: {e}")
-
-if __name__ == "__main__":
-    check_disk_usage_psutil("/")
-
-print(f"\nRunning 'df -hT' command using subprocess function")
-def check_disk_usage_subprocess():
-    """
-    Runs the 'df -hT' command and prints the output.
-    """
-    try:
-        # The command and its arguments must be a list
-        result = subprocess.check_output(["df", "-h", "-T",], universal_newlines=True)
-        print(result)
-    except FileNotFoundError:
-        print("Error: 'df' command not found. Are you on a Linux system?")
-    except Exception as e:
-        print(f"An error occurred: {e}")
-
-if __name__ == "__main__":
-    check_disk_usage_subprocess()
-
-
-print(f"\nRunning 'ps -ef' command using subprocess function with less secure way")
-command = "ps -e -f | grep java"
-try:
-    result = subprocess.check_output(command, shell=True, universal_newlines=True)
-    print(result)
-except subprocess.CalledProcessError as e:
-    print(f"Command failed with return code {e.returncode}, output: {e.output}")
-
-
-print(f"\nRunning 'ps -ef' command using subprocess.Popen() function to use Piping explicitly")
-try:
-    # First command: ps -e -f
-    process_ps = subprocess.Popen(["ps", "-e", "-f"], stdout=subprocess.PIPE, universal_newlines=True)
-    
-    # Second command: grep java
-    # stdin is set to the stdout of the first process
-    process_grep = subprocess.Popen(["grep", "java"], stdin=process_ps.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-    
-    # Allow process_ps to receive a SIGPIPE if process_grep exits
-    process_ps.stdout.close() 
-    
-    # Get the output and errors
-    stdout, stderr = process_grep.communicate()
-    
-    if stderr:
-        print(f"Error: {stderr}")
-    print(stdout)
-except Exception as e:
-    print(f"An error occurred: {e}")
-
-
-# Get CPU usage percentage
-cpu_usage = psutil.cpu_percent(interval=1)
-print(f"CPU Usage: {cpu_usage}%")
-
-# Get memory usage details
-memory_info = psutil.virtual_memory()
-print(f"Total Memory: {memory_info.total / (1024**3):.2f} GB")
-print(f"Used Memory: {memory_info.used / (1024**3):.2f} GB")
-print(f"Memory Percent Used: {memory_info.percent}%")
-
-# Iterate over all running processes
-print("\nTop processes by memory usage:")
-for proc in sorted(psutil.process_iter(['pid', 'name', 'memory_info']), key=lambda p: p.info['memory_info'].rss if p.info['memory_info'] else 0, reverse=True)[:5]:
-    print(f"PID: {proc.info['pid']}, Name: {proc.info['name']}, Memory Usage: {proc.info['memory_info'].rss / (1024 * 1024):.2f} MB")
-
-
-print(f"\nFinding the running python version using sys module")
-# Get the version as a string
-print("Python version as a string:")
-print(sys.version)
-print("-" * 20)
-
-# Get detailed version information as a tuple
-print("Python version info as a tuple:")
-print(sys.version_info)
-print("-" * 20)
-
-# Print the major, minor, and micro versions individually
-print("Major version:", sys.version_info.major)
-print("Minor version:", sys.version_info.minor)
-print("Micro version:", sys.version_info.micro)
-
-
-print(f"\nFinding the running python version using platform module")
-print("Python version using platform.python_version():")
-print(platform.python_version())
-print("-" * 20)
-
-print("Detailed build information using platform.python_build():")
-print(platform.python_build())
-print("-" * 20)
-
-print("Compiler information using platform.python_compiler():")
-print(platform.python_compiler())
+    asyncio.run(main())
